@@ -13,7 +13,6 @@ from tqdm import tqdm
 BATCH_SIZE = 2
 NUM_TASKS = 3
 
-# Environment setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Running on device:", device)
 
@@ -34,13 +33,13 @@ teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_config.base_model_name
 teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
 teacher_model.eval()
 
-# Load student base model and apply LoRA configuration
+
 student_base_model = AutoModelForCausalLM.from_pretrained(
     student_model_path,
     torch_dtype=torch.float16
 ).to(device)
 
-# Define LoRA configuration for student
+
 student_lora_config = LoraConfig(
     r=8,
     lora_alpha=16,
@@ -55,12 +54,11 @@ student_model = get_peft_model(student_base_model, student_lora_config).to(devic
 student_tokenizer = AutoTokenizer.from_pretrained(student_model_path)
 student_tokenizer.pad_token = student_tokenizer.eos_token
 
-# Prompt embedding module with improved initialization
+
 class PromptEmbedding(nn.Module):
     def __init__(self, prompt_length, hidden_size):
         super().__init__()
         print(f'Initializing prompt embeddings with dimensions: {prompt_length}, {hidden_size}')
-        # CHANGE 1: Better initialization of prompt embeddings with smaller values
         self.prompt_embeddings = nn.Parameter(torch.randn(NUM_TASKS, prompt_length, hidden_size) * 0.02)
     
     def forward(self, task_ids):
@@ -70,31 +68,21 @@ prompt_length = 20
 hidden_size = teacher_model.get_input_embeddings().embedding_dim
 prompt_module = PromptEmbedding(prompt_length, hidden_size).to(device)
 
-# === Improved Loss Functions ===
+
 def distillation_loss(student_logits, teacher_logits, labels=None, temperature=2.0):
-    """
-    Improved knowledge distillation loss with proper temperature scaling and masking
-    
-    Args:
-        student_logits: logits from student model [batch_size, seq_len, vocab_size]
-        teacher_logits: logits from teacher model [batch_size, seq_len, vocab_size]
-        labels: labels tensor for masking (-100 indicates tokens to ignore)
-        temperature: softmax temperature for distillation
-    """
-    # Shift logits to match sequence lengths (removing last token prediction)
+
     shift_student = student_logits[..., :-1, :].float()  # [batch_size, seq_len-1, vocab_size]
     shift_teacher = teacher_logits[..., :-1, :].float()  # [batch_size, seq_len-1, vocab_size]
     shift_labels = labels[..., 1:] if labels is not None else None  # [batch_size, seq_len-1]
-    
-    # Apply temperature scaling
+
     scaled_student = shift_student / temperature
     scaled_teacher = shift_teacher / temperature
     
-    # Compute log softmax and softmax
+
     log_probs_student = F.log_softmax(scaled_student, dim=-1)  # [batch_size, seq_len-1, vocab_size]
     probs_teacher = F.softmax(scaled_teacher, dim=-1)  # [batch_size, seq_len-1, vocab_size]
     
-    # Compute KL divergence: -sum(p(x) * log(q(x)))
+
     kl_div = F.kl_div(
         log_probs_student.view(-1, log_probs_student.size(-1)),
         probs_teacher.view(-1, probs_teacher.size(-1)),
@@ -104,18 +92,12 @@ def distillation_loss(student_logits, teacher_logits, labels=None, temperature=2
     # Reshape back
     kl_div = kl_div.view(shift_student.size(0), -1)  # [batch_size, seq_len-1]
     
-    # Create mask: ignore padding and special tokens
+
     if shift_labels is not None:
-        # Create mask based on label positions (-100 indicates positions to ignore)
         mask = (shift_labels != -100).float()
     else:
-        # If no labels provided, use all positions
         mask = torch.ones_like(kl_div)
-    
-    # Apply mask and compute mean loss
     masked_kl_div = (kl_div * mask).sum() / (mask.sum() + 1e-6)
-    
-    # Scale by temperature squared (as per the original KD paper)
     return masked_kl_div * (temperature ** 2)
 
 SUP_LOSS_FUNC = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
@@ -130,32 +112,21 @@ def supervised_loss(student_logits, labels):
     flat_logits = shift_logits.reshape(-1, shift_logits.shape[-1])  # [batch_size*seq_len-1, vocab_size]
     flat_labels = shift_labels.reshape(-1)  # [batch_size*seq_len-1]
     
-    # Compute token-level losses
     losses = SUP_LOSS_FUNC(flat_logits, flat_labels)  # [batch_size*seq_len-1]
     
-    # Reshape back and mask
+
     token_losses = losses.view(shift_labels.shape)  # [batch_size, seq_len-1]
     mask = (shift_labels != -100).float()  # [batch_size, seq_len-1]
     
-    # Compute masked average
+
     masked_loss = (token_losses * mask).sum() / (mask.sum() + 1e-6)
     return masked_loss
 
 def regularization_loss(teacher_logits_with_prompt, teacher_logits_no_prompt, labels=None, temperature=1.0):
-    """
-    Improved knowledge distillation loss with proper temperature scaling and masking
-    
-    Args:
-        student_logits: logits from student model [batch_size, seq_len, vocab_size]
-        teacher_logits: logits from teacher model [batch_size, seq_len, vocab_size]
-        labels: labels tensor for masking (-100 indicates tokens to ignore)
-        temperature: softmax temperature for distillation
-    """
 
     student_logits = teacher_logits_with_prompt
     teacher_logits = teacher_logits_no_prompt
 
-    # Shift logits to match sequence lengths (removing last token prediction)
     shift_student = student_logits[..., :-1, :].float()  # [batch_size, seq_len-1, vocab_size]
     shift_teacher = teacher_logits[..., :-1, :].float()  # [batch_size, seq_len-1, vocab_size]
     shift_labels = labels[..., 1:] if labels is not None else None  # [batch_size, seq_len-1]
@@ -164,55 +135,43 @@ def regularization_loss(teacher_logits_with_prompt, teacher_logits_no_prompt, la
     scaled_student = shift_student / temperature
     scaled_teacher = shift_teacher / temperature
     
-    # Compute log softmax and softmax
     log_probs_student = F.log_softmax(scaled_student, dim=-1)  # [batch_size, seq_len-1, vocab_size]
     probs_teacher = F.softmax(scaled_teacher, dim=-1)  # [batch_size, seq_len-1, vocab_size]
-    
-    # Compute KL divergence: -sum(p(x) * log(q(x)))
+
     kl_div = F.kl_div(
         log_probs_student.view(-1, log_probs_student.size(-1)),
         probs_teacher.view(-1, probs_teacher.size(-1)),
         reduction="none"
     ).sum(dim=-1)  # [batch_size * seq_len-1]
     
-    # Reshape back
+
     kl_div = kl_div.view(shift_student.size(0), -1)  # [batch_size, seq_len-1]
-    
-    # Create mask: ignore padding and special tokens
+
     if shift_labels is not None:
-        # Create mask based on label positions (-100 indicates positions to ignore)
         mask = (shift_labels != -100).float()
     else:
-        # If no labels provided, use all positions
         mask = torch.ones_like(kl_div)
     
-    # Apply mask and compute mean loss
     masked_kl_div = (kl_div * mask).sum() / (mask.sum() + 1e-6)
-    
-    # Scale by temperature squared (as per the original KD paper)
     return masked_kl_div * (temperature ** 2)
 
-# Forward pass with prompt
 def teacher_forward_with_prompt(teacher_model, input_ids, task_ids, attention_mask, prompt_module):
     """
     Forward pass through teacher model with learned prompt prepended to input
     """
     batch_size = input_ids.size(0)
-    
-    # Get input embeddings
+
     inputs_embeds = teacher_model.get_input_embeddings()(input_ids)
-    
-    # Get prompt embeddings for this batch's task IDs
+
     prompt_embeds = prompt_module(task_ids)
-    
-    # Concatenate prompt embeddings with input embeddings
+
     inputs_embeds = torch.cat([prompt_embeds, inputs_embeds], dim=1)
     
-    # Adjust attention mask to account for prompt tokens
+
     prompt_attention = torch.ones(batch_size, prompt_embeds.size(1)).to(attention_mask.device)
     attention_mask = torch.cat([prompt_attention, attention_mask], dim=1)
 
-    # Forward pass with the combined embeddings
+
     outputs = teacher_model(
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
@@ -221,7 +180,7 @@ def teacher_forward_with_prompt(teacher_model, input_ids, task_ids, attention_ma
     
     return outputs.logits
 
-# Dataset loading and preprocessing
+
 dataset = load_dataset("json", data_files="instruction_combined_1.jsonl")['train']
 EOS_TOKEN = student_tokenizer.eos_token
 dataset = dataset.shuffle(seed=120).select(range(int(0.03 * len(dataset))))
@@ -246,7 +205,7 @@ def preprocess_function(example, tokenizer):
     """
     Unified preprocessing function for both teacher and student
     """
-    # Format the input prompt
+
     prompt = f"""### Instruction:
 {example["instruction"]}
 
@@ -258,11 +217,9 @@ def preprocess_function(example, tokenizer):
     response = example["output"]
     full_text = prompt + response + EOS_TOKEN
 
-    # Tokenize with padding and truncation
     inputs_enc = tokenizer(full_text, truncation=True, padding="max_length", max_length=512, return_tensors="pt")
     input_ids = inputs_enc["input_ids"]
     
-    # Create labels by masking the prompt part with -100
     labels = input_ids.clone()
     prompt_length = len(tokenizer(prompt)["input_ids"])
     labels[:, :prompt_length] = -100
@@ -274,17 +231,16 @@ def preprocess_function(example, tokenizer):
         "task_type": get_task_id(example["instruction"]),
     }
 
-# Process datasets using the unified function
 train_dataset_teacher = train_data.map(lambda x: preprocess_function(x, teacher_tokenizer))
 val_dataset_teacher = val_data.map(lambda x: preprocess_function(x, teacher_tokenizer)) 
 train_dataset_student = train_data.map(lambda x: preprocess_function(x, student_tokenizer))
 val_dataset_student = val_data.map(lambda x: preprocess_function(x, student_tokenizer))
 
-# Set format to PyTorch tensors
+
 for dataset in [train_dataset_teacher, val_dataset_teacher, train_dataset_student, val_dataset_student]:
     dataset.set_format(type="torch")
 
-# Create data loaders with task IDs
+
 def create_dataloader(dataset, batch_size, shuffle=True):
     return DataLoader(
         dataset, 
@@ -303,12 +259,9 @@ val_loader_teacher = create_dataloader(val_dataset_teacher, BATCH_SIZE, shuffle=
 train_loader_student = create_dataloader(train_dataset_student, BATCH_SIZE)
 val_loader_student = create_dataloader(val_dataset_student, BATCH_SIZE, shuffle=False)
 
-# Optimizers
-# CHANGE 5: Lower learning rates
 prompt_optimizer = torch.optim.AdamW(prompt_module.parameters(), lr=1e-5)  # Changed from 5e-5
 student_optimizer = torch.optim.AdamW(student_model.parameters(), lr=1e-5)  # Changed from 5e-5
 
-# Training parameters
 total_steps = 10000
 current_step = 0
 VALIDATION_EVERY_N_STEPS = 200
@@ -317,7 +270,6 @@ best_val_loss = float('inf')
 last_best_checkpoint_folder = None
 last_best_prompt_file = None
 
-# Initialize wandb
 wandb.init(
     project="promptkd-distillation",
     name="improved-promptkd",
@@ -333,13 +285,11 @@ wandb.init(
     }
 )
 
-# Training loop
 steps_per_epoch = min(len(train_loader_student), len(train_loader_teacher))
 for epoch in range(2):  # Reduced to 2 epochs to match vanilla KD
     for (batch_student, batch_teacher) in tqdm(zip(train_loader_student, train_loader_teacher), 
                                               total=steps_per_epoch, 
                                               desc=f"Epoch {epoch+1}"):
-        # Move data to device
         input_ids_student = batch_student["input_ids"].to(device)
         input_ids_teacher = batch_teacher["input_ids"].to(device)
         task_ids = batch_teacher["task_id"].to(device)
@@ -348,14 +298,11 @@ for epoch in range(2):  # Reduced to 2 epochs to match vanilla KD
         labels = batch_student["labels"].to(device)
         
         with autocast():
-            # 1. Teacher forward pass with prompt
             teacher_logits_with_prompt = teacher_forward_with_prompt(
                 teacher_model, input_ids_teacher, task_ids, attention_mask_teacher, prompt_module
             )
-            # Trim the prompt tokens from the output
             teacher_logits_with_prompt = teacher_logits_with_prompt[:, prompt_length:, :]
             
-            # 2. Teacher forward pass without prompt (regular)
             teacher_outputs_no_prompt = teacher_model(
                 input_ids=input_ids_teacher,
                 attention_mask=attention_mask_teacher,
@@ -371,30 +318,24 @@ for epoch in range(2):  # Reduced to 2 epochs to match vanilla KD
                 use_cache=False,
             )
             student_logits = student_outputs.logits
-            
-            # 4. Compute losses
-            # 4a. Prompt optimization losses
+
             L_kd = distillation_loss(student_logits, teacher_logits_with_prompt, labels)
             L_reg = regularization_loss(teacher_logits_with_prompt, teacher_logits_no_prompt, labels)
             
-            # Decreasing weight for regularization
             reg_weight = max(0.0, 1.0 - (current_step / total_steps))
             prompt_loss = L_kd + reg_weight * L_reg
             
-            # 4b. Student optimization losses
             L_student_kd = distillation_loss(student_logits, teacher_logits_with_prompt)
             L_student_supervised = supervised_loss(student_logits, labels)
             
-            # CHANGE 4: Gradual loss blending - start with more supervised loss, gradually increase KD
             alpha = min(0.8, current_step / (total_steps * 0.5))  # Gradually increase to 0.8
             student_loss = alpha * L_student_kd + (1 - alpha) * L_student_supervised
         
-        # Update prompt parameters
+
         prompt_optimizer.zero_grad()
         scaler.scale(prompt_loss).backward(retain_graph=True)
         scaler.step(prompt_optimizer)
         
-        # Update student parameters
         student_optimizer.zero_grad()
         scaler.scale(student_loss).backward()
         scaler.step(student_optimizer)
